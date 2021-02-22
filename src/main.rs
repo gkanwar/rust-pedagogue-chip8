@@ -19,6 +19,8 @@ const ENTRY_ADDR: Addr = 0x200;
 const DISPLAY_WIDTH: usize = 64;
 const DISPLAY_HEIGHT: usize = 32;
 const DISPLAY_PIXELS: usize = DISPLAY_WIDTH * DISPLAY_HEIGHT;
+const SPRITE_HEIGHT: usize = 5;
+const SPRITE_ADDR: usize = 0;
 
 #[derive(Debug)]
 enum OpCode {
@@ -197,8 +199,17 @@ fn step_machine(state: &mut MachineState) -> bool {
   let mut jumped: bool = false;
   let mut drawn: bool = false;
   match opcode {
+    OpCode::ClearDisplay => {
+      state.display = [0; DISPLAY_PIXELS];
+      drawn = true;
+    }
     OpCode::Jump(addr) => {
       state.pc = addr;
+      assert!(is_valid_pc(addr));
+      jumped = true;
+    }
+    OpCode::JumpOff(addr) => {
+      state.pc = addr + (state.vx[0] as usize);
       assert!(is_valid_pc(addr));
       jumped = true;
     }
@@ -212,9 +223,28 @@ fn step_machine(state: &mut MachineState) -> bool {
       state.pc = addr;
       jumped = true;
     }
+    OpCode::Return => {
+      if state.sp == 0 {
+        panic!("Return from non-existant subroutine");
+      }
+      state.sp -= 1;
+      state.pc = state.stack[state.sp];
+      jumped = true;
+    }
     OpCode::AssignImm(reg, imm) => {
-      assert!(reg < 16);
       state.vx[reg as usize] = imm;
+    }
+    OpCode::Assign(r1, r2) => {
+      state.vx[r1 as usize] = state.vx[r2 as usize];
+    }
+    OpCode::BitOr(r1, r2) => {
+      state.vx[r1 as usize] |= state.vx[r2 as usize];
+    }
+    OpCode::BitAnd(r1, r2) => {
+      state.vx[r1 as usize] &= state.vx[r2 as usize];
+    }
+    OpCode::BitXor(r1, r2) => {
+      state.vx[r1 as usize] ^= state.vx[r2 as usize];
     }
     OpCode::Pointer(addr) => {
       state.i = addr;
@@ -244,22 +274,22 @@ fn step_machine(state: &mut MachineState) -> bool {
     }
     OpCode::IfEqImm(reg, imm) => {
       if state.vx[reg as usize] == imm {
-        state.pc += 2;
+        state.pc = get_next_pc(state.pc);
       }
     }
     OpCode::IfNeqImm(reg, imm) => {
       if state.vx[reg as usize] != imm {
-        state.pc += 2;
+        state.pc = get_next_pc(state.pc);
       }
     }
     OpCode::IfEq(r1, r2) => {
       if state.vx[r1 as usize] == state.vx[r2 as usize] {
-        state.pc += 2;
+        state.pc = get_next_pc(state.pc);
       }
     }
     OpCode::IfNeq(r1, r2) => {
       if state.vx[r1 as usize] != state.vx[r2 as usize] {
-        state.pc += 2;
+        state.pc = get_next_pc(state.pc);
       }
     }
     OpCode::AddImm(reg, imm) => {
@@ -286,10 +316,44 @@ fn step_machine(state: &mut MachineState) -> bool {
       state.vx[r1 as usize] = new_v1;
       state.vx[FLAG_REG] = overflow as u8;
     }
+    OpCode::ShiftL(reg) => {
+      state.vx[FLAG_REG] = state.vx[reg as usize] >> 7;
+      state.vx[reg as usize] <<= 1;
+    }
+    OpCode::ShiftR(reg) => {
+      state.vx[FLAG_REG] = state.vx[reg as usize] & 1;
+      state.vx[reg as usize] >>= 1;
+    }
+    OpCode::LoadSprite(reg) => {
+      let v = state.vx[reg as usize];
+      let sprite_addr = SPRITE_ADDR + (v as usize)*SPRITE_HEIGHT;
+      state.i = sprite_addr;
+    }
+    OpCode::StoreBCD(reg) => {
+      let v = state.vx[reg as usize];
+      let d0: u8 = (v / 100) % 10;
+      let d1: u8 = (v / 10) % 10;
+      let d2: u8 = v % 10;
+      state.memory[state.i] = d0;
+      state.memory[state.i+1] = d1;
+      state.memory[state.i+2] = d2;
+    }
+    OpCode::RegDump(reg) => {
+      for i in 0..reg+1 {
+        let off: usize = i as usize;
+        state.memory[state.i + off] = state.vx[off];
+      }
+    }
+    OpCode::RegLoad(reg) => {
+      for i in 0..reg+1 {
+        let off: usize = i as usize;
+        state.vx[off] = state.memory[state.i + off];
+      }
+    }
     _ => panic!("Unsupported opcode"),
   }
   if !jumped {
-    state.pc += 2;
+    state.pc = get_next_pc(state.pc);
   }
   assert!(is_valid_pc(state.pc));
   return drawn;
@@ -325,6 +389,30 @@ fn draw_display(state: &MachineState, screen: &mut [u8]) {
   }
 }
 
+fn init_sprites(state: &mut MachineState) {
+  const SPRITE_DATA: [u8; 16*SPRITE_HEIGHT] = [
+    0xf0, 0x90, 0x90, 0x90, 0x90,
+    0x20, 0x60, 0x20, 0x20, 0x70,
+    0xf0, 0x10, 0xf0, 0x80, 0xf0,
+    0xf0, 0x10, 0xf0, 0x10, 0xf0,
+    0x90, 0x90, 0xf0, 0x10, 0x10,
+    0xf0, 0x80, 0xf0, 0x10, 0xf0,
+    0xf0, 0x80, 0xf0, 0x90, 0xf0,
+    0xf0, 0x10, 0x20, 0x40, 0x40,
+    0xf0, 0x90, 0xf0, 0x90, 0xf0,
+    0xf0, 0x90, 0xf0, 0x10, 0xf0,
+    0xf0, 0x90, 0xf0, 0x90, 0x90,
+    0xe0, 0x90, 0xe0, 0x90, 0xe0,
+    0xf0, 0x80, 0x80, 0x80, 0xf0,
+    0xe0, 0x90, 0x90, 0x90, 0xe0,
+    0xf0, 0x80, 0xf0, 0x80, 0xf0,
+    0xf0, 0x80, 0xf0, 0x80, 0x80
+  ];
+  const SPRITE_START: usize = SPRITE_ADDR;
+  const SPRITE_END: usize = SPRITE_ADDR + 16 * SPRITE_HEIGHT;
+  state.memory[SPRITE_START .. SPRITE_END].copy_from_slice(&SPRITE_DATA);
+}
+
 fn main() -> Result<(), Error> {
   let matches = App::new("rust-pedagogue-chip8")
     .about("CHIP-8 Emulator")
@@ -346,6 +434,7 @@ fn main() -> Result<(), Error> {
     stack: [0; STACK_SIZE],
     display: [0; DISPLAY_PIXELS],
   };
+  init_sprites(&mut state);
   println!("Loading ROM from {}", rom_path);
   load_rom(rom_path, &mut state).expect("Failed to load ROM");
 
@@ -375,7 +464,7 @@ fn main() -> Result<(), Error> {
         return;
       },
       Event::MainEventsCleared => {
-        thread::sleep(time::Duration::from_millis(30));
+        // thread::sleep(time::Duration::from_millis(30));
         let drawn = step_machine(&mut state);
         if drawn {
           println!("Requesting redraw");
