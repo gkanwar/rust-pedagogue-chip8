@@ -1,3 +1,10 @@
+extern crate clap;
+
+use clap::{Arg, App};
+use std::io;
+use std::io::Read;
+use std::fs::File;
+
 type Addr = u16;
 type RegIdx = u8;
 const MEM_SIZE: usize = 0x1000;
@@ -5,6 +12,7 @@ const NUM_GP_REGS: usize = 16;
 const STACK_SIZE: usize = 16;
 const ENTRY_ADDR: Addr = 0x200;
 
+#[derive(Debug)]
 enum OpCode {
   CallMachine(Addr),
   ClearDisplay,
@@ -162,10 +170,14 @@ fn step_machine(state: &mut MachineState) -> () {
     state.memory[pc],
     state.memory[pc+1]]);
   // TODO: better error handling
-  let opcode: OpCode = parse_opcode(code).unwrap();
+  let opcode: OpCode = parse_opcode(code)
+    .expect(&format!("Unknown opcode {:04x}", code));
+  println!("STEP: opcode {:04x} {:?}", code, opcode);
+  let mut jumped: bool = false;
   match opcode {
     OpCode::Jump(addr) => {
       state.pc = addr;
+      jumped = true;
     },
     OpCode::Call(addr) => {
       if state.sp as usize == STACK_SIZE-1 {
@@ -177,13 +189,36 @@ fn step_machine(state: &mut MachineState) -> () {
         panic!("Invalid jump address");
       }
       state.pc = addr;
+      jumped = true;
     },
+    OpCode::AssignImm(reg, imm) => {
+      assert!(reg < 16);
+      state.vx[reg as usize] = imm;
+    },
+    OpCode::Pointer(addr) => {
+      state.i = addr;
+    }
     _ => panic!("Unsupported opcode")
   }
+  if !jumped {
+    state.pc += 2;
+  }
+  assert!((state.pc as usize) < MEM_SIZE);
+}
+
+fn load_rom(rom_path: & str, state: &mut MachineState) -> Result<(),io::Error> {
+  let mut f = File::open(&rom_path)?;
+  f.read(&mut state.memory[(ENTRY_ADDR as usize) ..])?;
+  return Ok(());
 }
 
 fn main() {
-  println!("Hello, world!");
+  let matches = App::new("rust-pedagogue-chip8")
+    .about("CHIP-8 Emulator")
+    .arg(Arg::with_name("rom_path").long("rom_path").value_name("rom_path").required(true))
+    .get_matches();
+  let rom_path = matches.value_of("rom_path").unwrap();
+
   let mut state = MachineState {
     memory: [0; MEM_SIZE],
     vx: [0; NUM_GP_REGS],
@@ -192,6 +227,11 @@ fn main() {
     sp: 0,
     stack: [0; STACK_SIZE]
   };
+
+
+  println!("Loading ROM from {}", rom_path);
+  load_rom(rom_path, &mut state).expect("Failed to load ROM");
+
   loop {
     step_machine(&mut state);
   }
