@@ -1,11 +1,14 @@
 use clap::{App, Arg};
 use pixels::{Error, Pixels, SurfaceTexture};
+use rand;
+use rand::Rng;
+use rand::rngs::{ThreadRng};
 use std::fs::File;
 use std::io::Read;
 use std::{io, panic, thread, time};
 use winit::{
   dpi::LogicalSize,
-  event::{Event, WindowEvent},
+  event::{Event, DeviceEvent, ElementState, KeyboardInput, ScanCode, WindowEvent},
   event_loop::{ControlFlow, EventLoop},
 };
 
@@ -21,6 +24,7 @@ const DISPLAY_HEIGHT: usize = 32;
 const DISPLAY_PIXELS: usize = DISPLAY_WIDTH * DISPLAY_HEIGHT;
 const SPRITE_HEIGHT: usize = 5;
 const SPRITE_ADDR: usize = 0;
+const RPL_SIZE: usize = 8;
 
 #[derive(Debug)]
 enum OpCode {
@@ -59,6 +63,8 @@ enum OpCode {
   StoreBCD(RegIdx),
   RegDump(RegIdx),
   RegLoad(RegIdx),
+  RegDumpRPL(RegIdx),
+  RegLoadRPL(RegIdx)
 }
 
 fn parse_opcode(code: u16) -> Option<OpCode> {
@@ -145,6 +151,10 @@ fn parse_opcode(code: u16) -> Option<OpCode> {
         Some(OpCode::RegDump(N1b))
       } else if N2 == 6 && N3 == 5 {
         Some(OpCode::RegLoad(N1b))
+      } else if N2 == 7 && N3 == 5 {
+        Some(OpCode::RegDumpRPL(N1b))
+      } else if N2 == 8 && N3 == 5 {
+        Some(OpCode::RegLoadRPL(N1b))
       } else {
         None
       }
@@ -163,7 +173,10 @@ struct MachineState {
   pc: Addr,
   sp: usize,
   stack: [Addr; STACK_SIZE],
+  rpl: [u8; RPL_SIZE],
   display: [u8; DISPLAY_PIXELS],
+  rng: ThreadRng,
+  key_wait_reg: i32
 }
 
 fn get_next_pc(pc: Addr) -> Addr {
@@ -187,9 +200,52 @@ fn _debug_print_display(state: &MachineState) {
   }
 }
 
-fn step_machine(state: &mut MachineState) -> bool {
+fn scancode_to_hex_key(scancode: ScanCode) -> Option<u8> {
+  return match scancode {
+    0x02 => Some(1),
+    0x03 => Some(2),
+    0x04 => Some(3),
+    0x05 => Some(0xc),
+    0x10 => Some(4),
+    0x11 => Some(5),
+    0x12 => Some(6),
+    0x13 => Some(0xd),
+    0x1e => Some(7),
+    0x1f => Some(8),
+    0x20 => Some(9),
+    0x21 => Some(0xe),
+    0x2c => Some(0xa),
+    0x2d => Some(0),
+    0x2e => Some(0xb),
+    0x2f => Some(0xf),
+    _ => None
+  }
+}
+
+fn step_machine(
+  state: &mut MachineState, key_presses: &mut Vec<KeyboardInput>,
+  key_states: &[bool]
+) -> bool {
   assert!(state.pc % 2 == 0);
   assert!((state.pc as usize) < MEM_SIZE);
+
+  // if waiting for key, don't step
+  if state.key_wait_reg >= 0 {
+    if key_presses.len() > 0 {
+      for key_press in key_presses.iter() {
+        if key_press.state == ElementState::Pressed {
+          if let Some(x) = scancode_to_hex_key(key_press.scancode) {
+            println!("Keypress: {:01x}", x);
+            state.vx[state.key_wait_reg as usize] = x;
+            state.key_wait_reg = -1;
+            break;
+          }
+        }
+      }
+      key_presses.clear();
+    }
+    return false;
+  }
 
   let pc: usize = state.pc as usize;
   let code: u16 = u16::from_be_bytes([state.memory[pc], state.memory[pc + 1]]);
@@ -249,6 +305,9 @@ fn step_machine(state: &mut MachineState) -> bool {
     OpCode::Pointer(addr) => {
       state.i = addr;
     }
+    OpCode::AddPointer(reg) => {
+      state.i += state.vx[reg as usize] as usize;
+    }
     OpCode::Draw(rx, ry, n_byte) => {
       let x0 = state.vx[rx as usize] as usize;
       let y0 = state.vx[ry as usize] as usize;
@@ -289,6 +348,16 @@ fn step_machine(state: &mut MachineState) -> bool {
     }
     OpCode::IfNeq(r1, r2) => {
       if state.vx[r1 as usize] != state.vx[r2 as usize] {
+        state.pc = get_next_pc(state.pc);
+      }
+    }
+    OpCode::IfKeyEq(reg) => {
+      if key_states[state.vx[reg as usize] as usize] {
+        state.pc = get_next_pc(state.pc);
+      }
+    }
+    OpCode::IfKeyNeq(reg) => {
+      if !key_states[state.vx[reg as usize] as usize] {
         state.pc = get_next_pc(state.pc);
       }
     }
@@ -349,6 +418,23 @@ fn step_machine(state: &mut MachineState) -> bool {
         let off: usize = i as usize;
         state.vx[off] = state.memory[state.i + off];
       }
+    }
+    OpCode::RegDumpRPL(reg) => {
+      for i in 0..reg+1 {
+        state.rpl[i as usize] = state.vx[i as usize];
+      }
+    }
+    OpCode::RegLoadRPL(reg) => {
+      for i in 0..reg+1 {
+        state.vx[i as usize] = state.rpl[i as usize];
+      }
+    }
+    OpCode::GetKey(reg) => {
+      assert!(state.key_wait_reg < 0);
+      state.key_wait_reg = reg as i32;
+    }
+    OpCode::Rand(reg, mask) => {
+      state.vx[reg as usize] = state.rng.gen::<u8>() % mask;
     }
     _ => panic!("Unsupported opcode"),
   }
@@ -432,7 +518,10 @@ fn main() -> Result<(), Error> {
     pc: ENTRY_ADDR,
     sp: 0,
     stack: [0; STACK_SIZE],
+    rpl: [0; RPL_SIZE],
     display: [0; DISPLAY_PIXELS],
+    rng: rand::thread_rng(),
+    key_wait_reg: -1
   };
   init_sprites(&mut state);
   println!("Loading ROM from {}", rom_path);
@@ -446,13 +535,13 @@ fn main() -> Result<(), Error> {
   let window_size = window.inner_size();
   let surface_texture = SurfaceTexture::new(window_size.width, window_size.height, &window);
   let mut pixels = Pixels::new(WINDOW_WIDTH, WINDOW_HEIGHT, surface_texture)?;
+  let mut key_events = Vec::new();
+  let mut key_states = [false; 16];
 
   event_loop.run(move |event, _, control_flow| {
     *control_flow = ControlFlow::Poll;
-    println!("event: {:?}", event);
     match event {
       Event::RedrawRequested(_) => {
-        println!("Redrawing");
         draw_display(&state, pixels.get_frame());
         if pixels.render().map_err(|e| {println!("err {}", e)}).is_err() {
           *control_flow = ControlFlow::Exit;
@@ -465,12 +554,20 @@ fn main() -> Result<(), Error> {
       },
       Event::MainEventsCleared => {
         // thread::sleep(time::Duration::from_millis(30));
-        let drawn = step_machine(&mut state);
+        let drawn = step_machine(&mut state, &mut key_events, &key_states);
         if drawn {
-          println!("Requesting redraw");
           window.request_redraw();
         }
       },
+      Event::DeviceEvent{device_id: _, event: DeviceEvent::Key(input)} => {
+        key_events.push(input);
+        if let Some(x) = scancode_to_hex_key(input.scancode) {
+          key_states[x as usize] = match input.state {
+            ElementState::Pressed => true,
+            ElementState::Released => false
+          };
+        }
+      }
       _ => ()
     };
   });
